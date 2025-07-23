@@ -7,6 +7,12 @@ from tax_engine import routes as tax_routes
 from submission import routes as submission_routes
 from payment import routes as payment_routes
 from admin import routes as admin_routes
+# create_tables.py
+from database import engine
+from models import Base
+
+Base.metadata.create_all(bind=engine)
+print("Tables created!")
 
 app = FastAPI(
     title="Tax Auto-Fill API",
