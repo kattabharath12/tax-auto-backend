@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 from database import SessionLocal
 from models import User
 import os
-import random
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "supersecretkey")
 ALGORITHM = "HS256"
@@ -64,17 +63,6 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
-class MFARequest(BaseModel):
-    email: str
-    password: str
-
-class MFAResponse(BaseModel):
-    email: str
-    mfa_code: str
-
-# In-memory MFA code store (for demo)
-mfa_codes = {}
-
 @router.post("/register", response_model=UserOut)
 def register(user: UserCreate, db: Session = Depends(get_db)):
     db_user = get_user_by_email(db, user.email)
@@ -95,32 +83,11 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     db.refresh(new_user)
     return UserOut(email=new_user.email, name=new_user.name, state=new_user.state)
 
-@router.post("/mfa/request", response_model=MFAResponse)
-def mfa_request(mfa: MFARequest, db: Session = Depends(get_db)):
-    user = authenticate_user(db, mfa.email, mfa.password)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    code = str(random.randint(100000, 999999))
-    mfa_codes[mfa.email] = code
-    # In production, send code via email/SMS
-    print(f"[DEBUG] MFA code for {mfa.email}: {code}")
-    return MFAResponse(email=mfa.email, mfa_code=code)
-
-class MFAVerifyRequest(BaseModel):
-    email: str
-    mfa_code: str
-
 @router.post("/token", response_model=Token)
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    # MFA: expects username=email, password=mfa_code
-    email = form_data.username
-    code = form_data.password
-    if email not in mfa_codes or mfa_codes[email] != code:
-        raise HTTPException(status_code=401, detail="Invalid MFA code")
-    user = get_user_by_email(db, email)
+    user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    del mfa_codes[email]
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
     access_token = create_access_token(data={"sub": user.email})
     return Token(access_token=access_token, token_type="bearer")
 
