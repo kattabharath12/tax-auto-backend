@@ -66,3 +66,24 @@ def get_stats(current_user = Depends(get_current_user), db: Session = Depends(ge
         "submission_stats": {},
         "payment_stats": {}
     }
+# ADD THIS TO admin/routes.py
+@router.get("/users")
+def get_all_users(
+    current_user = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    """Get all users for admin"""
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    users = db.query(User).all()
+    return [
+        {
+            "id": u.id,
+            "email": u.email,
+            "name": u.name or "N/A",
+            "state": u.state or "N/A",
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+            "is_active": getattr(u, 'is_active', True)
+        } for u in users
+    ]
