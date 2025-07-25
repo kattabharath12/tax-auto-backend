@@ -86,14 +86,14 @@ class DocumentProcessor:
                 r'17\s+state.*?(\d{1,6}(?:\.\d{2})?)',
             ],
             'employer_name': [
-                # Box c: Employer's name - look for text after employer designation
-                r'c\s+employer[\'']?s name.*?[\n\s]+([A-Za-z][A-Za-z\s&.,\-]{2,50}?)(?:\n|\d|$)',
-                r'employer[\'']?s name.*?[\n\s]+([A-Za-z][A-Za-z\s&.,\-]{2,50}?)(?:\n|$)',
-                # Look for company-like names in the document
-                r'([A-Z][A-Za-z\s&]{3,30}(?:Inc|LLC|Corp|Company|Co\.|Ltd)\.?)',
-                # Extract multi-word capitalized names
-                r'([A-Z][a-z]+ [A-Z][a-z]+(?:\s[A-Z][a-z]+)*)',
-            ],
+    # Box c: Employer's name - look for text after employer designation
+    r'c\s+employers?\s+name.*?[\n\s]+([A-Za-z][A-Za-z\s&.,\-]{2,50}?)(?:\n|\d|$)',
+    r'employer\s+name.*?[\n\s]+([A-Za-z][A-Za-z\s&.,\-]{2,50}?)(?:\n|$)',
+    # Look for company-like names in the document
+    r'([A-Z][A-Za-z\s&]{3,30}(?:Inc|LLC|Corp|Company|Co\.|Ltd)\.?)',
+    # Extract multi-word capitalized names
+    r'([A-Z][a-z]+ [A-Z][a-z]+(?:\s[A-Z][a-z]+)*)',
+],
             'employer_ein': [
                 # Box b: Employer identification number - look for EIN format
                 r'b\s+employer identification number.*?[\n\s]+([A-Z0-9\-]{9,12})',
