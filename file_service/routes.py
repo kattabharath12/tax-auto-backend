@@ -65,3 +65,45 @@ def list_files(current_user = Depends(get_current_user), db: Session = Depends(g
             } for d in docs
         ]
     }
+# ADD THIS TO file_service/routes.py
+@router.get("/user-documents")
+async def get_user_documents(
+    current_user = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get all documents for the current user"""
+    try:
+        docs = db.query(Document).filter(Document.user_email == current_user.email).all()
+        
+        documents = []
+        for doc in docs:
+            doc_data = {
+                "id": doc.id,
+                "filename": doc.filename,
+                "document_type": doc.document_type,
+                "upload_date": doc.uploaded_at.isoformat() if doc.uploaded_at else None,
+                "extracted_data": json.loads(doc.extracted_data) if doc.extracted_data else None
+            }
+            documents.append(doc_data)
+        
+        return documents
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch documents: {str(e)}")
+
+# ADD THIS TOO
+@router.get("/download/{document_id}")
+async def download_file(
+    document_id: str,
+    current_user = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Download a specific document"""
+    doc = db.query(Document).filter(
+        Document.id == document_id,
+        Document.user_email == current_user.email
+    ).first()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    return {"download_url": f"/uploads/{doc.filename}", "filename": doc.filename}
