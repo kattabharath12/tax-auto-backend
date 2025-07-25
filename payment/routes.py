@@ -54,3 +54,26 @@ def list_payments(current_user = Depends(get_current_user), db: Session = Depend
             } for p in payments
         ]
     }
+# ADD THIS TO payment/routes.py
+@router.get("/history")
+def get_payment_history(
+    current_user = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    """Get payment history for current user"""
+    try:
+        payments = db.query(Payment).filter(Payment.user_email == current_user.email).all()
+        
+        return [
+            {
+                "id": p.id,
+                "amount": p.amount,
+                "status": p.status,
+                "payment_method": p.payment_method,
+                "payment_date": p.created_at.isoformat() if p.created_at else None,
+                "transaction_id": f"txn_{p.id[:8]}",
+                "description": "Tax Payment"
+            } for p in payments
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch payment history: {str(e)}")
