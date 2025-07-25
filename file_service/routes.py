@@ -8,7 +8,7 @@ from database import SessionLocal
 from models import Document
 from auth.routes import get_current_user
 # Replace the mock import with real processor
-from file_service.real_ocr_processor import extract_document_data
+from .ocr_mock import extract_document_data
 
 router = APIRouter()
 
