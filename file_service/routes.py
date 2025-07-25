@@ -169,45 +169,53 @@ def list_files(current_user = Depends(get_current_user), db: Session = Depends(g
     """Legacy endpoint - redirects to user-documents"""
     return get_user_documents(current_user, db)
 
-@router.get("/debug-ocr/{document_id}")
-async def debug_ocr_extraction(
-    document_id: str,
-    current_user = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Debug endpoint to see exactly what OCR is extracting"""
-    
-    doc = db.query(Document).filter(
-        Document.id == document_id,
-        Document.user_email == current_user.email
-    ).first()
-    
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
+@router.get("/ocr-status")
+async def check_ocr_status():
+    """Check if OCR libraries are available"""
+    status = {
+        "ocr_available": False,
+        "missing_libraries": [],
+        "system_info": {}
+    }
     
     try:
-        # Extract raw text again
-        if doc.content_type == "application/pdf":
-            # Simple text extraction for debugging
-            import PyPDF2
-            with open(doc.file_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                raw_text = ""
-                for page in pdf_reader.pages:
-                    raw_text += page.extract_text() + "\n"
-        
-        # Find all numbers
-        import re
-        all_numbers = re.findall(r'\d+(?:\.\d{2})?', raw_text)
-        
-        return {
-            "document_id": document_id,
-            "filename": doc.filename,
-            "raw_text_preview": raw_text[:1000],
-            "all_numbers_found": all_numbers[:15],
-            "text_lines": raw_text.split('\n')[:15],
-            "current_extraction": json.loads(doc.extracted_data) if doc.extracted_data else None
-        }
-        
+        import pytesseract
+        status["pytesseract"] = "✅ Available"
+    except ImportError as e:
+        status["missing_libraries"].append(f"pytesseract: {e}")
+    
+    try:
+        import cv2
+        status["opencv"] = "✅ Available"
+    except ImportError as e:
+        status["missing_libraries"].append(f"opencv: {e}")
+    
+    try:
+        from PIL import Image
+        status["pillow"] = "✅ Available"
+    except ImportError as e:
+        status["missing_libraries"].append(f"pillow: {e}")
+    
+    try:
+        import PyPDF2
+        status["pypdf2"] = "✅ Available"
+    except ImportError as e:
+        status["missing_libraries"].append(f"pypdf2: {e}")
+    
+    try:
+        from pdf2image import convert_from_path
+        status["pdf2image"] = "✅ Available"
+    except ImportError as e:
+        status["missing_libraries"].append(f"pdf2image: {e}")
+    
+    # Check if tesseract executable is available
+    try:
+        import subprocess
+        result = subprocess.run(['tesseract', '--version'], capture_output=True, text=True)
+        status["tesseract_executable"] = f"✅ Available: {result.stdout.split()[1] if result.stdout else 'Unknown version'}"
     except Exception as e:
-        return {"error": str(e), "debug": "Failed to extract"}
+        status["missing_libraries"].append(f"tesseract executable: {e}")
+    
+    status["ocr_available"] = len(status["missing_libraries"]) == 0
+    
+    return status
