@@ -168,3 +168,46 @@ async def delete_document(
 def list_files(current_user = Depends(get_current_user), db: Session = Depends(get_db)):
     """Legacy endpoint - redirects to user-documents"""
     return get_user_documents(current_user, db)
+
+@router.get("/debug-ocr/{document_id}")
+async def debug_ocr_extraction(
+    document_id: str,
+    current_user = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Debug endpoint to see exactly what OCR is extracting"""
+    
+    doc = db.query(Document).filter(
+        Document.id == document_id,
+        Document.user_email == current_user.email
+    ).first()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    try:
+        # Extract raw text again
+        if doc.content_type == "application/pdf":
+            # Simple text extraction for debugging
+            import PyPDF2
+            with open(doc.file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                raw_text = ""
+                for page in pdf_reader.pages:
+                    raw_text += page.extract_text() + "\n"
+        
+        # Find all numbers
+        import re
+        all_numbers = re.findall(r'\d+(?:\.\d{2})?', raw_text)
+        
+        return {
+            "document_id": document_id,
+            "filename": doc.filename,
+            "raw_text_preview": raw_text[:1000],
+            "all_numbers_found": all_numbers[:15],
+            "text_lines": raw_text.split('\n')[:15],
+            "current_extraction": json.loads(doc.extracted_data) if doc.extracted_data else None
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "debug": "Failed to extract"}
