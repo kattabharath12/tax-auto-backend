@@ -5,7 +5,6 @@ import random
 import platform
 from typing import Dict, Any, Optional, List, Tuple
 
-# Try to import OCR libraries, fallback to mock if not available
 try:
     import pytesseract
     from PIL import Image
@@ -13,13 +12,15 @@ try:
     from pdf2image import convert_from_path
     import cv2
     import numpy as np
+    
+    # FORCE OCR to be available - override any detection issues
     OCR_AVAILABLE = True
     
     # Set Tesseract path based on platform
     if platform.system() == "Windows":
         pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
     
-    print("✅ OCR libraries loaded successfully")
+    print("✅ OCR libraries loaded successfully - FORCED MODE")
     
 except ImportError as e:
     print(f"⚠️  OCR libraries not available, using mock data: {e}")
@@ -107,10 +108,13 @@ class DocumentProcessor:
         }
 
     def extract_document_data(self, file_path: str, content_type: str) -> Dict[str, Any]:
-        """Main method to extract data from uploaded documents"""
-        if not OCR_AVAILABLE:
-            print("Using mock data - OCR not available")
-            return self._generate_mock_data(file_path)
+    """Main method to extract data from uploaded documents"""
+    
+    print(f"🔍 DEBUG: OCR_AVAILABLE = {OCR_AVAILABLE}")  # Add this line
+    
+    if not OCR_AVAILABLE:
+        print("Using mock data - OCR not available")
+        return self._generate_mock_data(file_path)
         
         try:
             print(f"Processing document with GENERIC W-2 patterns: {os.path.basename(file_path)}")
