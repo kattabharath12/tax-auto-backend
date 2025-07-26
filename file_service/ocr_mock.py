@@ -44,7 +44,7 @@ class DocumentProcessor:
                 r'employer identification number\s*\n?\s*([A-Z0-9\-]{9,12})',
                 r'ein\s*:?\s*([A-Z0-9\-]{9,12})',
                 r'(\d{2}-\d{7})',  # Standard EIN format
-                r'([A-Z]{2,4}\d{7,9})',  # Alternative format
+                r'([A-Z]{2,4}\d{7,9})',  # Alternative format like FGHU7896901
             ],
             
             # Employee Name - Box e
@@ -61,53 +61,57 @@ class DocumentProcessor:
                 r'([A-Z][A-Za-z\s&]{3,50}(?:Inc|LLC|Corp|Company|Co\.|Ltd)\.?)',
             ],
             
-            # Box 1: Wages, tips, other compensation
+            # Box 1: Wages, tips, other compensation - FIXED PATTERNS
             'wages': [
-                r'1\s+wages,?\s*tips,?\s*other compensation\s*\n?\s*(\d{1,8}(?:\.\d{2})?)',
-                r'wages.*?(\d{4,8}(?:\.\d{2})?)',
-                r'box\s*1.*?(\d{4,8}(?:\.\d{2})?)',
+                # Target the specific structure: EIN followed by wages amount
+                r'([A-Z]{4}\d{7})\s+(\d{4,6})\s+\d{1,4}',  # Captures wages from "FGHU7896901 30000 350"
+                r'1\s+wages,?\s*tips,?\s*other compensation\s*\n?\s*(\d{4,6}(?:\.\d{2})?)',
+                r'wages.*?compensation[:\s]*(\d{4,6}(?:\.\d{2})?)',
+                r'box\s*1[:\s]*(\d{4,6}(?:\.\d{2})?)',
             ],
             
-            # Box 2: Federal income tax withheld
+            # Box 2: Federal income tax withheld - FIXED PATTERNS  
             'federal_withholding': [
-                r'2\s+federal income tax withheld\s*\n?\s*(\d{1,6}(?:\.\d{2})?)',
-                r'federal.*?withheld.*?(\d{1,6}(?:\.\d{2})?)',
-                r'box\s*2.*?(\d{1,6}(?:\.\d{2})?)',
+                # Target smaller numbers after wages: "30000 350" -> extract 350
+                r'([A-Z]{4}\d{7})\s+\d{4,6}\s+(\d{1,4})',  # Captures withholding from "FGHU7896901 30000 350"
+                r'2\s+federal income tax withheld\s*\n?\s*(\d{1,4}(?:\.\d{2})?)',
+                r'federal.*?withheld[:\s]*(\d{1,4}(?:\.\d{2})?)',
+                r'box\s*2[:\s]*(\d{1,4}(?:\.\d{2})?)',
             ],
             
             # Box 3: Social security wages
             'social_security_wages': [
-                r'3\s+social security wages\s*\n?\s*(\d{1,8}(?:\.\d{2})?)',
-                r'social security wages.*?(\d{1,8}(?:\.\d{2})?)',
-                r'box\s*3.*?(\d{1,8}(?:\.\d{2})?)',
+                r'3\s+social security wages\s*\n?\s*(\d{4,6}(?:\.\d{2})?)',
+                r'social security wages[:\s]*(\d{4,6}(?:\.\d{2})?)',
+                r'box\s*3[:\s]*(\d{4,6}(?:\.\d{2})?)',
             ],
             
             # Box 4: Social security tax withheld
             'social_security_tax': [
-                r'4\s+social security tax withheld\s*\n?\s*(\d{1,6}(?:\.\d{2})?)',
-                r'social security tax.*?(\d{1,6}(?:\.\d{2})?)',
-                r'box\s*4.*?(\d{1,6}(?:\.\d{2})?)',
+                r'4\s+social security tax withheld\s*\n?\s*(\d{1,4}(?:\.\d{2})?)',
+                r'social security tax[:\s]*(\d{1,4}(?:\.\d{2})?)',
+                r'box\s*4[:\s]*(\d{1,4}(?:\.\d{2})?)',
             ],
             
             # Box 5: Medicare wages and tips
             'medicare_wages': [
-                r'5\s+medicare wages and tips\s*\n?\s*(\d{1,8}(?:\.\d{2})?)',
-                r'medicare wages.*?(\d{1,8}(?:\.\d{2})?)',
-                r'box\s*5.*?(\d{1,8}(?:\.\d{2})?)',
+                r'5\s+medicare wages and tips\s*\n?\s*(\d{4,6}(?:\.\d{2})?)',
+                r'medicare wages[:\s]*(\d{4,6}(?:\.\d{2})?)',
+                r'box\s*5[:\s]*(\d{4,6}(?:\.\d{2})?)',
             ],
             
             # Box 6: Medicare tax withheld
             'medicare_tax': [
-                r'6\s+medicare tax withheld\s*\n?\s*(\d{1,6}(?:\.\d{2})?)',
-                r'medicare tax.*?(\d{1,6}(?:\.\d{2})?)',
-                r'box\s*6.*?(\d{1,6}(?:\.\d{2})?)',
+                r'6\s+medicare tax withheld\s*\n?\s*(\d{1,4}(?:\.\d{2})?)',
+                r'medicare tax[:\s]*(\d{1,4}(?:\.\d{2})?)',
+                r'box\s*6[:\s]*(\d{1,4}(?:\.\d{2})?)',
             ],
             
             # State withholding
             'state_withholding': [
-                r'17\s+state income tax\s*\n?\s*(\d{1,6}(?:\.\d{2})?)',
-                r'state.*?tax.*?(\d{1,6}(?:\.\d{2})?)',
-                r'box\s*17.*?(\d{1,6}(?:\.\d{2})?)',
+                r'17\s+state income tax\s*\n?\s*(\d{1,4}(?:\.\d{2})?)',
+                r'state.*?tax[:\s]*(\d{1,4}(?:\.\d{2})?)',
+                r'box\s*17[:\s]*(\d{1,4}(?:\.\d{2})?)',
             ]
         }
 
@@ -328,8 +332,8 @@ class DocumentProcessor:
         return min(score, 1.0)
 
     def _extract_w2_data_precise(self, text: str) -> Dict[str, Any]:
-        """Precise W2 data extraction using enhanced patterns"""
-        print("\n=== STARTING PRECISE W2 EXTRACTION ===")
+        """Enhanced W2 extraction that handles the EIN+wages+withholding line pattern"""
+        print("\n=== STARTING ENHANCED W2 EXTRACTION ===")
         
         data = {
             "document_type": "W-2",
@@ -339,14 +343,29 @@ class DocumentProcessor:
             "raw_text_sample": text[:500] + "..." if len(text) > 500 else text
         }
         
-        # Clean and normalize text
+        # Clean text
         clean_text = self._clean_text_for_w2(text)
         
-        successful_extractions = 0
-        total_fields = len(self.w2_patterns)
+        # Special handling for the EIN+wages+withholding pattern
+        # Look for pattern like: "FGHU7896901 30000 350"
+        ein_wages_pattern = r'([A-Z]{4}\d{7})\s+(\d{4,6})\s+(\d{1,4})'
+        ein_match = re.search(ein_wages_pattern, clean_text)
         
-        # Extract each field using patterns
+        if ein_match:
+            data['employer_ein'] = ein_match.group(1)
+            data['wages'] = float(ein_match.group(2))
+            data['federal_withholding'] = float(ein_match.group(3))
+            data['debug_info'].append(f"✅ Found EIN line pattern: {ein_match.group(0)}")
+            print(f"✅ EIN line pattern: EIN={ein_match.group(1)}, Wages={ein_match.group(2)}, Fed={ein_match.group(3)}")
+        
+        # Continue with other patterns for remaining fields
+        successful_extractions = 3 if ein_match else 0  # Count the EIN line fields
+        
         for field_name, patterns in self.w2_patterns.items():
+            # Skip if we already extracted from EIN line
+            if ein_match and field_name in ['employer_ein', 'wages', 'federal_withholding']:
+                continue
+                
             best_value = None
             best_confidence = 0
             
@@ -358,7 +377,8 @@ class DocumentProcessor:
                     
                     for match in matches:
                         if isinstance(match, tuple):
-                            match = match[0] if match else ""
+                            # For tuple matches, take the last group (the value)
+                            match = match[-1] if match else ""
                         
                         cleaned_value = self._clean_extracted_value(match, field_name)
                         
@@ -386,6 +406,7 @@ class DocumentProcessor:
                 print(f"❌ {field_name}: No reliable extraction")
         
         # Calculate overall confidence
+        total_fields = len(self.w2_patterns)
         data['confidence'] = successful_extractions / total_fields if total_fields > 0 else 0
         
         print(f"\n📊 EXTRACTION SUMMARY:")
@@ -414,7 +435,7 @@ class DocumentProcessor:
         return cleaned
 
     def _clean_extracted_value(self, value: str, field_type: str) -> Any:
-        """Clean and validate extracted values"""
+        """Clean and validate extracted values with better range checking"""
         if not value:
             return None
         
@@ -422,30 +443,52 @@ class DocumentProcessor:
         
         if field_type in ['wages', 'federal_withholding', 'social_security_wages', 
                          'social_security_tax', 'medicare_wages', 'medicare_tax', 'state_withholding']:
-            # Numeric fields
+            # Enhanced numeric field cleaning
             cleaned = re.sub(r'[^\d.]', '', value)
+            
+            # Handle multiple decimal points
+            if cleaned.count('.') > 1:
+                parts = cleaned.split('.')
+                cleaned = parts[0] + '.' + ''.join(parts[1:])
+            
             try:
-                num_value = float(cleaned)
-                return num_value if 0 <= num_value <= 1000000 else None
+                num_value = float(cleaned) if cleaned else 0.0
+                
+                # STRICT range validation to prevent incorrect large numbers
+                if field_type == 'wages':
+                    # Wages should be reasonable annual amounts
+                    return num_value if 1000 <= num_value <= 300000 else None
+                elif field_type in ['federal_withholding', 'state_withholding']:
+                    # Withholding should be much smaller than wages
+                    return num_value if 0 <= num_value <= 25000 else None
+                elif field_type in ['social_security_wages', 'medicare_wages']:
+                    # Similar to wages but can be capped
+                    return num_value if 1000 <= num_value <= 200000 else None
+                elif field_type in ['social_security_tax', 'medicare_tax']:
+                    # Payroll taxes are relatively small
+                    return num_value if 0 <= num_value <= 15000 else None
+                else:
+                    return num_value if 0 <= num_value <= 300000 else None
+                    
             except (ValueError, TypeError):
                 return None
         
         elif field_type == 'employee_ssn':
-            # SSN formatting
             digits = re.sub(r'\D', '', value)
             if len(digits) == 9:
                 return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
             return None
         
         elif field_type == 'employer_ein':
-            # EIN formatting
-            if re.match(r'\d{2}-?\d{7}', value):
+            # Handle both standard format and alternative like FGHU7896901
+            if re.match(r'[A-Z]{4}\d{7}', value):
+                return value  # Keep as-is for alternative format
+            elif re.match(r'\d{2}-?\d{7}', value):
                 digits = re.sub(r'\D', '', value)
                 return f"{digits[:2]}-{digits[2:]}" if len(digits) == 9 else value
             return value if len(value) >= 9 else None
         
         else:
-            # Text fields
             return value if 2 <= len(value) <= 100 else None
 
     def _calculate_field_confidence(self, field_name: str, value: Any, context: str) -> float:
@@ -468,7 +511,7 @@ class DocumentProcessor:
                 confidence += 0.4
         
         elif field_name == 'employer_ein' and isinstance(value, str):
-            if re.match(r'\d{2}-\d{7}', value):
+            if re.match(r'\d{2}-\d{7}', value) or re.match(r'[A-Z]{4}\d{7}', value):
                 confidence += 0.4
         
         # Context bonus
