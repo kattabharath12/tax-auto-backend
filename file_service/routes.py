@@ -219,3 +219,111 @@ async def check_ocr_status():
     status["ocr_available"] = len(status["missing_libraries"]) == 0
     
     return status
+
+@router.get("/debug-ocr-public/{document_id}")
+async def debug_ocr_extraction_public(
+    document_id: str,
+    db: Session = Depends(get_db)
+):
+    """Public debug endpoint to see exactly what OCR is extracting"""
+    
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    try:
+        # Extract raw text again
+        if doc.content_type == "application/pdf":
+            # Simple text extraction for debugging
+            import PyPDF2
+            with open(doc.file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                raw_text = ""
+                for page in pdf_reader.pages:
+                    raw_text += page.extract_text() + "\n"
+        else:
+            raw_text = "Non-PDF file - OCR would be used"
+        
+        # Find all numbers
+        import re
+        all_numbers = re.findall(r'\d+(?:\.\d{2})?', raw_text)
+        
+        return {
+            "document_id": document_id,
+            "filename": doc.filename,
+            "raw_text_preview": raw_text[:1000],
+            "all_numbers_found": all_numbers[:15],
+            "text_lines": raw_text.split('\n')[:15],
+            "current_extraction": json.loads(doc.extracted_data) if doc.extracted_data else None
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "debug": "Failed to extract"}
+
+@router.post("/force-real-ocr/{document_id}")
+async def force_real_ocr(
+    document_id: str,
+    db: Session = Depends(get_db)
+):
+    """Force real OCR processing - public version"""
+    
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    try:
+        print("=== FORCING REAL OCR ===")
+        
+        # Import and create processor directly
+        from .ocr_mock import DocumentProcessor
+        processor = DocumentProcessor()
+        
+        # Check OCR availability at processor level
+        from .ocr_mock import OCR_AVAILABLE
+        print(f"OCR_AVAILABLE in processor: {OCR_AVAILABLE}")
+        
+        # Force OCR processing
+        result = processor.extract_document_data(doc.file_path, doc.content_type)
+        
+        # Update document
+        old_data = json.loads(doc.extracted_data) if doc.extracted_data else {}
+        doc.extracted_data = json.dumps(result)
+        db.commit()
+        
+        return {
+            "message": "Forced OCR processing completed",
+            "document_id": document_id,
+            "filename": doc.filename,
+            "ocr_available_check": OCR_AVAILABLE,
+            "before_extraction": old_data.get("extraction_method", "Unknown"),
+            "after_extraction": result.get("extraction_method", "Unknown"),
+            "before_wages": old_data.get("wages", "N/A"),
+            "after_wages": result.get("wages", "N/A"),
+            "debug_info": result.get("debug_info", []),
+            "full_result": result
+        }
+        
+    except Exception as e:
+        import traceback
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "document_path": doc.file_path,
+            "content_type": doc.content_type
+        }
+
+@router.get("/documents-public")
+async def get_documents_public(db: Session = Depends(get_db)):
+    """Get recent documents (public) - for debugging"""
+    docs = db.query(Document).order_by(Document.uploaded_at.desc()).limit(5).all()
+    
+    return [
+        {
+            "id": doc.id,
+            "filename": doc.filename,
+            "upload_date": doc.uploaded_at.isoformat() if doc.uploaded_at else None,
+            "extraction_method": json.loads(doc.extracted_data).get("extraction_method", "Unknown") if doc.extracted_data else "No data"
+        }
+        for doc in docs
+    ]
