@@ -1,555 +1,429 @@
-import os
-import json
+import pytesseract
+import pdfplumber
+from pdf2image import convert_from_path
+from PIL import Image, ImageEnhance, ImageFilter
 import re
-import random
-import platform
-from typing import Dict, Any, Optional, List, Tuple
+import os
+import logging
+from typing import Dict, Any, Optional, Tuple, List
+import cv2
+import numpy as np
+import tempfile
 
-try:
-    import pytesseract
-    from PIL import Image
-    import PyPDF2
-    from pdf2image import convert_from_path
-    import cv2
-    import numpy as np
-    
-    # FORCE OCR to be available - override any detection issues
-    OCR_AVAILABLE = True
-    
-    # Set Tesseract path based on platform
-    if platform.system() == "Windows":
-        pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-    
-    print("✅ OCR libraries loaded successfully - FORCED MODE")
-    
-except ImportError as e:
-    print(f"⚠️  OCR libraries not available, using mock data: {e}")
-    OCR_AVAILABLE = False
+logger = logging.getLogger("W2 Extractor")
 
-class DocumentProcessor:
-    def __init__(self):
-        # Generic W-2 box patterns that work for ANY W-2 document
-        self.w2_box_patterns = {
-            'wages': [
-                # Box 1: Wages, tips, other compensation - look for number after the description
-                r'(?:^|\n|\s)1\s+wages[,\s]*tips[,\s]*other compensation\s*[\n\s]*(\d{1,8}(?:\.\d{2})?)',
-                r'(?:^|\n)1\s+wages.*?[\n\s]+(\d{1,8}(?:\.\d{2})?)',
-                r'wages[,\s]*tips[,\s]*other compensation[\s\n]*(\d{1,8}(?:\.\d{2})?)',
-                # Look for number in the wages box area (after "1" and wage-related text)
-                r'1\s+(?:wages|salary).*?(\d{4,8}(?:\.\d{2})?)',
-                # Generic pattern for first major number after wages mention
-                r'(?:wages|salary|gross pay).*?(\d{4,8}(?:\.\d{2})?)',
-                # Pattern for standalone large number (likely wages)
-                r'(?:^|\n)\s*(\d{4,8}(?:\.\d{2})?)\s*(?:\n|$)',
-            ],
-            'federal_withholding': [
-                # Box 2: Federal income tax withheld
-                r'(?:^|\n|\s)2\s+federal income tax withheld\s*[\n\s]*(\d{1,6}(?:\.\d{2})?)',
-                r'(?:^|\n)2\s+federal.*?[\n\s]+(\d{1,6}(?:\.\d{2})?)',
-                r'federal income tax withheld[\s\n]*(\d{1,6}(?:\.\d{2})?)',
-                r'2\s+federal.*?(\d{1,6}(?:\.\d{2})?)',
-                # Look for smaller numbers associated with federal tax
-                r'(?:federal tax|fed.*withh).*?(\d{1,6}(?:\.\d{2})?)',
-            ],
-            'social_security_wages': [
-                # Box 3: Social security wages
-                r'(?:^|\n|\s)3\s+social security wages\s*[\n\s]*(\d{1,8}(?:\.\d{2})?)',
-                r'(?:^|\n)3\s+social.*?[\n\s]+(\d{1,8}(?:\.\d{2})?)',
-                r'social security wages[\s\n]*(\d{1,8}(?:\.\d{2})?)',
-                r'3\s+social.*?(\d{1,8}(?:\.\d{2})?)',
-            ],
-            'social_security_withholding': [
-                # Box 4: Social security tax withheld
-                r'(?:^|\n|\s)4\s+social security tax withheld\s*[\n\s]*(\d{1,6}(?:\.\d{2})?)',
-                r'(?:^|\n)4\s+social.*tax.*?[\n\s]+(\d{1,6}(?:\.\d{2})?)',
-                r'social security tax withheld[\s\n]*(\d{1,6}(?:\.\d{2})?)',
-                r'4\s+social.*tax.*?(\d{1,6}(?:\.\d{2})?)',
-            ],
-            'medicare_wages': [
-                # Box 5: Medicare wages and tips
-                r'(?:^|\n|\s)5\s+medicare wages and tips\s*[\n\s]*(\d{1,8}(?:\.\d{2})?)',
-                r'(?:^|\n)5\s+medicare.*?[\n\s]+(\d{1,8}(?:\.\d{2})?)',
-                r'medicare wages and tips[\s\n]*(\d{1,8}(?:\.\d{2})?)',
-                r'5\s+medicare.*?(\d{1,8}(?:\.\d{2})?)',
-            ],
-            'medicare_withholding': [
-                # Box 6: Medicare tax withheld
-                r'(?:^|\n|\s)6\s+medicare tax withheld\s*[\n\s]*(\d{1,6}(?:\.\d{2})?)',
-                r'(?:^|\n)6\s+medicare.*tax.*?[\n\s]+(\d{1,6}(?:\.\d{2})?)',
-                r'medicare tax withheld[\s\n]*(\d{1,6}(?:\.\d{2})?)',
-                r'6\s+medicare.*tax.*?(\d{1,6}(?:\.\d{2})?)',
-            ],
-            'state_withholding': [
-                # Box 17: State income tax
-                r'(?:^|\n|\s)17\s+state income tax\s*[\n\s]*(\d{1,6}(?:\.\d{2})?)',
-                r'(?:^|\n)17\s+state.*?[\n\s]+(\d{1,6}(?:\.\d{2})?)',
-                r'state income tax[\s\n]*(\d{1,6}(?:\.\d{2})?)',
-                r'17\s+state.*?(\d{1,6}(?:\.\d{2})?)',
-            ],
-            'employer_name': [
-                # Box c: Employer's name - look for text after employer designation
-                r'c\s+employers?\s+name.*?[\n\s]+([A-Za-z][A-Za-z\s&.,\-]{2,50}?)(?:\n|\d|$)',
-                r'employer\s+name.*?[\n\s]+([A-Za-z][A-Za-z\s&.,\-]{2,50}?)(?:\n|$)',
-                # Look for company-like names in the document
-                r'([A-Z][A-Za-z\s&]{3,30}(?:Inc|LLC|Corp|Company|Co\.|Ltd)\.?)',
-                # Extract multi-word capitalized names
-                r'([A-Z][a-z]+ [A-Z][a-z]+(?:\s[A-Z][a-z]+)*)',
-            ],
-            'employer_ein': [
-                # Box b: Employer identification number - look for EIN format
-                r'b\s+employer identification number.*?[\n\s]+([A-Z0-9\-]{9,12})',
-                r'employer identification number.*?[\n\s]+([A-Z0-9\-]{9,12})',
-                r'ein[:\s]*([A-Z0-9\-]{9,12})',
-                # Standard EIN format: XX-XXXXXXX
-                r'(\d{2}-\d{7})',
-                # Alternative formats
-                r'([A-Z]{2,4}\d{7,9})',
-            ]
-        }
+class W2Extractor:
 
-    def extract_document_data(self, file_path: str, content_type: str) -> Dict[str, Any]:
-        """Main method to extract data from uploaded documents"""
-        
-        print(f"🔍 DEBUG: OCR_AVAILABLE = {OCR_AVAILABLE}")
-        
-        if not OCR_AVAILABLE:
-            print("Using mock data - OCR not available")
-            return self._generate_mock_data(file_path)
-            
-        try:
-            print(f"Processing document with ENHANCED OCR: {os.path.basename(file_path)}")
-            
-            # Extract text from document
-            extracted_text = self._extract_text_from_file(file_path, content_type)
-            
-            if not extracted_text or len(extracted_text.strip()) < 3:
-                print("OCR extraction failed or insufficient text, using mock data")
-                return self._generate_mock_data(file_path)
-            
-            print(f"Extracted text length: {len(extracted_text)} characters")
-            
-            # Clean and normalize text for better pattern matching
-            normalized_text = self._normalize_text_for_w2(extracted_text)
-            
-            # Show sample of extracted text for debugging
-            print("=== EXTRACTED TEXT SAMPLE ===")
-            print(extracted_text[:500])
-            print("=== END SAMPLE ===")
-            
-            # Determine document type
-            doc_type = self._identify_document_type(normalized_text, file_path)
-            print(f"Identified document type: {doc_type}")
-            
-            if doc_type == "W-2":
-                return self._extract_w2_data_generic(normalized_text, extracted_text)
-            else:
-                return self._extract_generic_data(normalized_text)
-                
-        except Exception as e:
-            print(f"OCR processing failed: {e}, falling back to mock data")
-            import traceback
-            traceback.print_exc()
-            return self._generate_mock_data(file_path)
+    def _init_(self):
+        pass
 
-    def _extract_text_from_file(self, file_path: str, content_type: str) -> str:
-        """Extract text using multiple methods for maximum coverage - FIXED for image PDFs"""
-        all_text = ""
+    def extract_additional_w2_fields(self, lines):
+        data = {}
         
-        try:
-            if content_type == "application/pdf":
-                print(f"Processing PDF: {file_path}")
-                
-                # Method 1: Direct PDF text extraction
-                direct_text = ""
-                try:
-                    with open(file_path, 'rb') as file:
-                        pdf_reader = PyPDF2.PdfReader(file)
-                        for page in pdf_reader.pages:
-                            page_text = page.extract_text()
-                            if page_text.strip():
-                                direct_text += page_text + "\n"
-                    
-                    if direct_text.strip():
-                        print(f"✅ PDF direct extraction successful: {len(direct_text)} characters")
-                        all_text += "=== PDF DIRECT EXTRACTION ===\n" + direct_text + "\n"
-                    else:
-                        print("⚠️  PDF direct extraction returned empty - trying OCR")
-                        
-                except Exception as e:
-                    print(f"❌ PDF direct extraction failed: {e}")
-                
-                # Method 2: OCR on PDF images (ALWAYS try this for tax documents)
-                print("🔄 Attempting OCR on PDF images...")
-                try:
-                    # Convert PDF to images with high DPI for better OCR
-                    images = convert_from_path(file_path, dpi=400, first_page=1, last_page=1)
-                    print(f"📄 Converted PDF to {len(images)} image(s)")
-                    
-                    if images:
-                        image = images[0]  # Process first page
-                        print(f"🖼️  Image size: {image.size}")
-                        
-                        # Try multiple OCR configurations for tax forms
-                        ocr_configs = [
-                            '--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .,\n-',
-                            '--psm 4 --oem 3',
-                            '--psm 6 --oem 3',
-                            '--psm 12 --oem 3',
-                        ]
-                        
-                        best_ocr_text = ""
-                        best_score = 0
-                        
-                        for i, config in enumerate(ocr_configs):
-                            try:
-                                print(f"🔍 Trying OCR config {i+1}: {config}")
-                                ocr_text = pytesseract.image_to_string(image, config=config)
-                                
-                                if ocr_text.strip():
-                                    score = self._score_w2_ocr_text(ocr_text)
-                                    print(f"✅ OCR config {i+1} result: {len(ocr_text)} chars, score: {score:.2f}")
-                                    print(f"📝 Sample: {ocr_text[:100]}...")
-                                    
-                                    if score > best_score:
-                                        best_ocr_text = ocr_text
-                                        best_score = score
-                                        print(f"🏆 New best OCR result!")
-                                else:
-                                    print(f"❌ OCR config {i+1}: No text extracted")
-                                    
-                            except Exception as config_e:
-                                print(f"❌ OCR config {i+1} failed: {config_e}")
-                                continue
-                        
-                        if best_ocr_text.strip():
-                            all_text += "=== OCR EXTRACTION ===\n" + best_ocr_text + "\n"
-                            print(f"✅ Best OCR result: {len(best_ocr_text)} characters, score: {best_score:.2f}")
-                        else:
-                            print("❌ All OCR attempts failed to extract meaningful text")
-                    else:
-                        print("❌ Failed to convert PDF to images")
-                    
-                except Exception as ocr_e:
-                    print(f"❌ PDF OCR processing failed: {ocr_e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            elif content_type.startswith("image/"):
-                print(f"Processing image: {file_path}")
-                try:
-                    image = cv2.imread(file_path)
-                    if image is not None:
-                        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-                        enhanced = cv2.equalizeHist(gray)
-                        denoised = cv2.fastNlMeansDenoising(enhanced)
-                        
-                        ocr_text = pytesseract.image_to_string(denoised, config='--psm 6 --oem 3')
-                        all_text += "=== IMAGE OCR ===\n" + ocr_text + "\n"
-                        print(f"✅ Image OCR: {len(ocr_text)} characters")
-                    else:
-                        pil_image = Image.open(file_path)
-                        ocr_text = pytesseract.image_to_string(pil_image)
-                        all_text += "=== PIL OCR ===\n" + ocr_text + "\n"
-                        print(f"✅ PIL OCR: {len(ocr_text)} characters")
-                    
-                except Exception as e:
-                    print(f"❌ Image OCR failed: {e}")
-        
-        except Exception as e:
-            print(f"❌ Overall text extraction error: {e}")
-        
-        print(f"📊 Final extracted text length: {len(all_text)} characters")
-        if all_text.strip():
-            print(f"📝 Text preview: {all_text[:200]}...")
-        else:
-            print("⚠️  WARNING: No text extracted - will fall back to mock data")
-        
-        return all_text
+        for i, line in enumerate(lines):
+            # Employee name
+            if "employee’sname" in line.lower() or "employee’s name" in line.lower():
+                name_line = lines[i + 1] if i + 1 < len(lines) else ""
+                if len(name_line.split()) >= 2:
+                    data['employee_name'] = name_line.strip()
 
-    def _score_w2_ocr_text(self, text: str) -> float:
-        """Score OCR text quality specifically for W-2 forms"""
-        if not text.strip():
-            return 0.0
-        
-        score = 0.0
-        text_lower = text.lower()
-        
-        # Check for W-2 specific terms
-        w2_terms = ['w-2', 'wage', 'tax', 'statement', 'withheld', 'social security', 'medicare', 'federal', 'employer', 'employee']
-        found_terms = sum(1 for term in w2_terms if term in text_lower)
-        score += (found_terms / len(w2_terms)) * 0.4
-        
-        # Check for specific W-2 box indicators
-        box_terms = ['wages tips other compensation', 'federal income tax withheld', 'social security wages', 'medicare wages']
-        found_boxes = sum(1 for term in box_terms if term in text_lower)
-        score += (found_boxes / len(box_terms)) * 0.3
-        
-        # Check for numbers (tax forms have many numbers)
-        numbers = re.findall(r'\d+', text)
-        if len(numbers) >= 5:  # Should have multiple numbers
-            score += 0.2
-        
-        # Check for reasonable text length
-        if 100 <= len(text) <= 5000:  # Reasonable length for W-2
-            score += 0.1
-        
-        return min(score, 1.0)
+            # Employee address
+            if "employee’sname,address,andzipcode" in line.lower() or "employee’s name, address, and zip code" in line.lower():
+                addr1 = lines[i + 1] if i + 1 < len(lines) else ""
+                addr2 = lines[i + 2] if i + 2 < len(lines) else ""
+                data['employee_address'] = f"{addr1.strip()} {addr2.strip()}"
 
-    def _normalize_text_for_w2(self, text: str) -> str:
-        """Normalize text for better W-2 pattern matching"""
-        # Convert to lowercase for easier matching
-        normalized = text.lower()
-        
-        # Clean up extra whitespace
-        normalized = re.sub(r'\s+', ' ', normalized)
-        
-        # Ensure clear separation around numbers
-        normalized = re.sub(r'(\d)([a-z])', r'\1 \2', normalized)
-        normalized = re.sub(r'([a-z])(\d)', r'\1 \2', normalized)
-        
-        # Clean up common OCR artifacts
-        normalized = re.sub(r'[^\w\s\-\.,\n]', ' ', normalized)
-        
-        # Ensure line breaks are preserved for box structure
-        normalized = re.sub(r'\n+', '\n', normalized)
-        
-        return normalized
+            # Wages (Box 1)
+            if "1 wages" in line.lower():
+                for offset in range(1, 4):
+                    value_line = lines[i + offset] if i + offset < len(lines) else ""
+                    match = re.search(r"\d{1,3}(?:,\d{3})*(?:\.\d{2})?", value_line)
+                    if match:
+                        data['wages'] = match.group().replace(",", "")
+                        break
 
-    def _extract_w2_data_generic(self, normalized_text: str, original_text: str) -> Dict[str, Any]:
-        """Generic W-2 data extraction that works for any W-2"""
-        data = {
-            "document_type": "W-2",
-            "confidence": 0.0,
-            "extraction_method": "Generic Pattern Matching",
-            "debug_info": [],
-            "field_details": {}
-        }
-        
-        texts_to_search = [normalized_text, original_text, original_text.lower()]
-        successful_extractions = 0
-        total_fields = len(self.w2_box_patterns)
-        
-        for field, patterns in self.w2_box_patterns.items():
-            best_value = None
-            best_confidence = 0
-            attempts = []
-            
-            for text_version in texts_to_search:
-                for i, pattern in enumerate(patterns):
-                    try:
-                        matches = re.findall(pattern, text_version, re.IGNORECASE | re.MULTILINE)
-                        
-                        for match in matches:
-                            value = match.strip() if isinstance(match, str) else str(match)
-                            
-                            if field in ['wages', 'federal_withholding', 'social_security_wages', 
-                                       'social_security_withholding', 'medicare_wages', 'medicare_withholding', 'state_withholding']:
-                                # Numeric fields
-                                cleaned_value = self._clean_currency_safe(value)
-                                
-                                if cleaned_value is not None and 0 <= cleaned_value <= 1000000:
-                                    confidence = self._calculate_field_confidence(field, cleaned_value, text_version)
-                                    attempts.append({
-                                        'pattern': f"Pattern {i+1}",
-                                        'raw_match': value,
-                                        'cleaned_value': cleaned_value,
-                                        'confidence': confidence
-                                    })
-                                    
-                                    if confidence > best_confidence:
-                                        best_value = cleaned_value
-                                        best_confidence = confidence
-                            else:
-                                # Text fields
-                                if 2 <= len(value) <= 50 and not value.isdigit():
-                                    confidence = 0.6 if len(value) > 5 else 0.4
-                                    attempts.append({
-                                        'pattern': f"Pattern {i+1}",
-                                        'raw_match': value,
-                                        'cleaned_value': value,
-                                        'confidence': confidence
-                                    })
-                                    
-                                    if confidence > best_confidence:
-                                        best_value = value
-                                        best_confidence = confidence
-                    
-                    except Exception as e:
-                        attempts.append({
-                            'pattern': f"Pattern {i+1}",
-                            'error': str(e)
-                        })
-            
-            # Store results
-            if best_value is not None and best_confidence > 0.3:  # Minimum confidence threshold
-                data[field] = best_value
-                data['field_details'][field] = {
-                    'value': best_value,
-                    'confidence': best_confidence,
-                    'attempts': attempts
-                }
-                successful_extractions += 1
-                data["debug_info"].append(f"✅ {field}: {best_value} (confidence: {best_confidence:.2f})")
-            else:
-                data["debug_info"].append(f"❌ {field}: No reliable extraction")
-                data['field_details'][field] = {
-                    'value': None,
-                    'confidence': 0,
-                    'attempts': attempts
-                }
-        
-        # Set defaults for missing critical fields
-        data.setdefault('wages', 0.0)
-        data.setdefault('federal_withholding', 0.0)
-        data.setdefault('state_withholding', 0.0)
-        data.setdefault('employer_name', 'Not found')
-        
-        # Calculate overall confidence
-        data['confidence'] = successful_extractions / total_fields if total_fields > 0 else 0
-        
-        print(f"\n=== W-2 EXTRACTION SUMMARY ===")
-        print(f"Successful extractions: {successful_extractions}/{total_fields}")
-        print(f"Overall confidence: {data['confidence']:.2f}")
-        
-        # Show key extracted values
-        key_fields = ['wages', 'federal_withholding', 'social_security_wages', 'medicare_wages']
-        for field in key_fields:
-            if field in data and isinstance(data[field], (int, float)):
-                print(f"{field}: ${data[field]:,.2f}")
-        
+            # Federal income tax withheld (Box 2)
+            if "2 federal" in line.lower():
+                for offset in range(1, 4):
+                    value_line = lines[i + offset] if i + offset < len(lines) else ""
+                    match = re.search(r"\d{1,3}(?:,\d{3})*(?:\.\d{2})?", value_line)
+                    if match:
+                        data['federal_tax_withheld'] = match.group().replace(",", "")
+                        break
+
+            # Medicare tax withheld
+            if "medicare tax" in line.lower():
+                match = re.search(r"\d{1,3}(?:,\d{3})*(?:\.\d{2})?", line)
+                if match:
+                    data['medicare_tax_withheld'] = match.group().replace(",", "")
+
+            # Social Security tax withheld
+            if "social security tax" in line.lower():
+                match = re.search(r"\d{1,3}(?:,\d{3})*(?:\.\d{2})?", line)
+                if match:
+                    data['social_security_tax_withheld'] = match.group().replace(",", "")
+
+            # State income tax
+            if "state income tax" in line.lower():
+                match = re.search(r"\d{1,3}(?:,\d{3})*(?:\.\d{2})?", line)
+                if match:
+                    data['state_income_tax'] = match.group().replace(",", "")
+
+            # Local income tax
+            if "local income tax" in line.lower():
+                match = re.search(r"\d{1,3}(?:,\d{3})*(?:\.\d{2})?", line)
+                if match:
+                    data['local_income_tax'] = match.group().replace(",", "")
+
         return data
 
-    def _clean_currency_safe(self, value: str) -> Optional[float]:
-        """Safely clean currency values with strict validation"""
-        if not value or not isinstance(value, str):
-            return None
-        
-        # Remove common formatting
-        cleaned = re.sub(r'[$,\s]', '', value.strip())
-        
-        # Remove any non-numeric characters except decimal point
-        cleaned = re.sub(r'[^\d.]', '', cleaned)
-        
-        # Handle multiple decimal points
-        if cleaned.count('.') > 1:
-            parts = cleaned.split('.')
-            cleaned = parts[0] + '.' + ''.join(parts[1:])
-        
-        # Must have at least one digit
-        if not re.search(r'\d', cleaned):
-            return None
-        
-        try:
-            result = float(cleaned)
-            # Reasonable bounds for W-2 values
-            if 0 <= result <= 10000000:
-                return result
-        except (ValueError, OverflowError):
-            pass
-        
-        return None
 
-    def _calculate_field_confidence(self, field: str, value: float, context: str) -> float:
-        """Calculate confidence based on field type and value reasonableness"""
-        confidence = 0.4  # Base confidence
+    def detect_and_crop_boxes(self, image_path: str) -> List[np.ndarray]:
+        """
+        Detect rectangular boxes from the form and return cropped box images.
+        Useful when W2 is structured with defined fields.
+        """
+        try:
+            image = cv2.imread(image_path)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+            # Use adaptive thresholding to highlight box edges
+            thresh = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 10
+            )
+
+            # Find contours
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            cropped_boxes = []
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w > 60 and h > 20:  # Filter out small boxes
+                    cropped = image[y:y + h, x:x + w]
+                    cropped_boxes.append(cropped)
+
+            logger.info(f"🟦 Found {len(cropped_boxes)} candidate boxes for OCR")
+            return cropped_boxes
+        except Exception as e:
+            logger.error(f"Box detection failed: {e}")
+            return []
+
+    def extract_text_from_image(self, image_path: str) -> Tuple[str, float]:
+        """
+        Extracts text from an image using OCR.
+        Applies thresholding and attempts to extract from detected form boxes.
+        """
+
+        logger.info("Inside extract text from image")
+        try:
+            img = cv2.imread(image_path)
+            if img is None:
+                return "", 0.0
+
+            # Convert and threshold
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # Save thresholded image
+            temp_path = image_path.replace('.', '_processed.')
+            cv2.imwrite(temp_path, thresh)
+
+            # Try box-based OCR first
+            text = ""
+            box_confidences = []
+            box_images = self.detect_and_crop_boxes(temp_path)
+
+            if box_images:
+                for idx, box in enumerate(box_images):
+                    temp_box_path = f"{temp_path}box{idx}.png"
+                    cv2.imwrite(temp_box_path, box)
+                    box_text = pytesseract.image_to_string(temp_box_path, config="--oem 3 --psm 6")
+                    data = pytesseract.image_to_data(temp_box_path, config="--oem 3 --psm 6", output_type=pytesseract.Output.DICT)
+                    confs = [int(c) for c in data['conf'] if c.isdigit() and int(c) > 0]
+                    if confs:
+                        box_confidences.extend(confs)
+                    text += "\n" + box_text
+                    os.remove(temp_box_path)
+            else:
+                # Fall back to full image OCR
+                text = pytesseract.image_to_string(temp_path, config="--oem 3 --psm 6")
+                data = pytesseract.image_to_data(temp_path, config="--oem 3 --psm 6", output_type=pytesseract.Output.DICT)
+                box_confidences = [int(c) for c in data['conf'] if c.isdigit() and int(c) > 0]
+
+            # Cleanup
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+            avg_conf = sum(box_confidences) / len(box_confidences) if box_confidences else 0.0
+            return text, avg_conf / 100.0
+
+        except Exception as e:
+            logger.error(f"OCR error: {e}")
+            return "", 0.0
+
+    # [The rest of your W2Extractor class remains the same here]
+    # ⬇️ You can continue with parse_w2_line_by_line, process_document, etc.
+
+    def extract_text_from_pdf_page(self, pdf_path: str, page_num: int) -> Tuple[str, float]:
+        """Extract text from specific PDF page"""
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                if page_num < len(pdf.pages):
+                    page = pdf.pages[page_num]
+                    text = page.extract_text()
+                    if text and len(text.strip()) > 50:
+                        logger.info(f"Page {page_num + 1} extracted {len(text)} characters")
+                        return text, 0.9
+            
+            # Fallback to OCR
+            with tempfile.TemporaryDirectory() as temp_dir:
+                images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1, dpi=300)
+                if images:
+                    temp_image_path = os.path.join(temp_dir, f"page_{page_num}.png")
+                    images[0].save(temp_image_path, 'PNG')
+                    return self.extract_text_from_image(temp_image_path)
+                    
+        except Exception as e:
+            logger.error(f"Error extracting from page {page_num}: {e}")
+            
+        return "", 0.0
+
+    def parse_w2_line_by_line(self, text: str) -> Dict[str, Any]:
+        """Parse W2 text line by line using the actual structure"""
+        extracted = {}
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
         
-        # Field-specific validation
-        if field == 'wages':
-            if 1000 <= value <= 500000:
-                confidence += 0.4
-            elif 10000 <= value <= 200000:
-                confidence += 0.5  # Most common range
-        elif field in ['federal_withholding', 'state_withholding']:
-            if 0 <= value <= 100000:
-                confidence += 0.3
-            if value > 0:  # Non-zero withholding is expected
-                confidence += 0.2
-        elif field in ['social_security_wages', 'medicare_wages']:
-            if 100 <= value <= 200000:
-                confidence += 0.4
-        elif field in ['social_security_withholding', 'medicare_withholding']:
-            if 0 <= value <= 20000:
-                confidence += 0.3
+        logger.info("=== PARSING W2 LINE BY LINE ===")
+        logger.info(f"Total lines: {len(lines)}")
         
-        # Context bonus (if found near relevant keywords)
-        field_keywords = {
-            'wages': ['wage', 'salary', 'gross', 'compensation'],
-            'federal_withholding': ['federal', 'tax', 'withheld'],
-            'social_security_wages': ['social security', 'ss wages'],
-            'medicare_wages': ['medicare', 'med wages']
-        }
+        # Print all lines for debugging
+        for i, line in enumerate(lines):
+            logger.info(f"Line {i+1}: {line}")
         
-        if field in field_keywords:
-            for keyword in field_keywords[field]:
-                if keyword in context.lower():
-                    confidence += 0.1
+        # Parse each line for specific patterns
+        for i, line in enumerate(lines):
+            line_lower = line.lower()
+            
+            # Line 2: SSN (after VOID)
+            if 'void' in line_lower and re.search(r'\d{10}', line):
+                ssn_match = re.search(r'(\d{10})', line)
+                if ssn_match:
+                    ssn = ssn_match.group(1)
+                    # Format as SSN (taking last 9 digits if 10 digits found)
+                    if len(ssn) == 10:
+                        ssn = ssn[1:]  # Remove first digit
+                    extracted['employee_ssn'] = f"{ssn[:3]}-{ssn[3:5]}-{ssn[5:]}"
+                    logger.info(f"✅ Found SSN: {extracted['employee_ssn']} (line {i+1})")
+            
+            # EIN and Box 1,2 amounts - Line like "FGHU7896901 30000 350"
+            if re.match(r'^[A-Z]{4}\d{7}\s+\d+\s+\d+', line):
+                parts = line.split()
+                if len(parts) >= 3:
+                    extracted['employer_ein'] = parts[0]
+                    extracted['wages_tips_compensation'] = float(parts[1])
+                    extracted['federal_income_tax_withheld'] = float(parts[2])
+                    logger.info(f"✅ Found EIN: {parts[0]} (line {i+1})")
+                    logger.info(f"✅ Found wages (Box 1): ${float(parts[1]):,.2f} (line {i+1})")
+                    logger.info(f"✅ Found federal tax (Box 2): ${float(parts[2]):,.2f} (line {i+1})")
+            
+            # Employer name line - after EIN line, contains address
+            if 'employer' in line_lower and 'name' in line_lower and i+1 < len(lines):
+                employer_line = lines[i+1]
+                # Clean up the employer name (remove trailing numbers that are SS amounts)
+                employer_parts = employer_line.split()
+                # Keep only the name/address part, remove trailing numbers
+                name_parts = []
+                for part in employer_parts:
+                    if part.isdigit() and len(part) <= 3:  # Skip small numbers (likely SS amounts)
+                        break
+                    name_parts.append(part)
+                if name_parts:
+                    extracted['employer_name'] = ' '.join(name_parts)
+                    logger.info(f"✅ Found employer name: {extracted['employer_name']} (line {i+2})")
+                
+                # Extract SS wages and tax from the numbers at the end
+                numbers = re.findall(r'\b(\d{1,4})\b', employer_line)
+                if len(numbers) >= 2:
+                    extracted['social_security_wages'] = float(numbers[-2])
+                    extracted['social_security_tax_withheld'] = float(numbers[-1])
+                    logger.info(f"✅ Found SS wages (Box 3): ${float(numbers[-2]):,.2f} (line {i+2})")
+                    logger.info(f"✅ Found SS tax (Box 4): ${float(numbers[-1]):,.2f} (line {i+2})")
+            
+            # Medicare line - Line like "500 540"
+            if re.match(r'^\d{3,4}\s+\d{3,4}$', line):
+                parts = line.split()
+                if len(parts) == 2:
+                    # Check if this follows a Medicare wages line
+                    if i > 0 and 'medicare' in lines[i-1].lower():
+                        extracted['medicare_wages'] = float(parts[0])
+                        extracted['medicare_tax_withheld'] = float(parts[1])
+                        logger.info(f"✅ Found Medicare wages (Box 5): ${float(parts[0]):,.2f} (line {i+1})")
+                        logger.info(f"✅ Found Medicare tax (Box 6): ${float(parts[1]):,.2f} (line {i+1})")
+            
+            # Employee name - Line with names after "first name and initial Last name"
+            if 'first name' in line_lower and 'last name' in line_lower and i+1 < len(lines):
+                name_line = lines[i+1]
+                # Extract names (filter out numbers and single letters)
+                name_parts = re.findall(r'\b[A-Z][A-Za-z]{1,}\b', name_line)
+                if len(name_parts) >= 2:
+                    extracted['employee_name'] = ' '.join(name_parts)
+                    logger.info(f"✅ Found employee name: {extracted['employee_name']} (line {i+2})")
+                elif len(name_parts) == 1:
+                    extracted['employee_name'] = name_parts[0]
+                    logger.info(f"✅ Found employee name: {extracted['employee_name']} (line {i+2})")
+        
+        # Extract tax year from anywhere in the text
+        year_matches = re.findall(r'\b(20\d{2})\b', text)
+        if year_matches:
+            years = [int(y) for y in year_matches if 2020 <= int(y) <= 2025]
+            if years:
+                extracted['tax_year'] = max(years)
+                logger.info(f"✅ Found tax year: {extracted['tax_year']}")
+        
+        # Fallback for missing fields using general patterns
+        if 'employee_ssn' not in extracted:
+            # Look for any SSN pattern
+            ssn_patterns = [r'(\d{3}-\d{2}-\d{4})', r'(\d{9})']
+            for pattern in ssn_patterns:
+                matches = re.findall(pattern, text)
+                for match in matches:
+                    clean_ssn = re.sub(r'[-\s]', '', match)
+                    if len(clean_ssn) == 9 and clean_ssn not in ['123456789', '000000000']:
+                        extracted['employee_ssn'] = f"{clean_ssn[:3]}-{clean_ssn[3:5]}-{clean_ssn[5:]}"
+                        logger.info(f"✅ Found SSN (fallback): {extracted['employee_ssn']}")
+                        break
+                if 'employee_ssn' in extracted:
                     break
         
-        return min(confidence, 1.0)
+        if 'employer_ein' not in extracted:
+            # Look for EIN patterns
+            ein_matches = re.findall(r'\b([A-Z]{2,5}\d{7,10})\b', text)
+            for ein in ein_matches:
+                if len(ein) >= 9:
+                    extracted['employer_ein'] = ein
+                    logger.info(f"✅ Found EIN (fallback): {ein}")
+                    break
+        
+        # Validate and clean up amounts
+        for key in ['wages_tips_compensation', 'federal_income_tax_withheld', 
+                   'social_security_wages', 'social_security_tax_withheld',
+                   'medicare_wages', 'medicare_tax_withheld']:
+            if key in extracted:
+                # Ensure reasonable ranges
+                amount = extracted[key]
+                if amount < 0 or amount > 9999999:
+                    logger.warning(f"Removing unrealistic amount for {key}: ${amount}")
+                    del extracted[key]
+        
+        return extracted
 
-    def _identify_document_type(self, text: str, filename: str) -> str:
-        """Identify document type"""
-        text_lower = text.lower()
-        filename_lower = os.path.basename(filename).lower()
-        
-        # Check filename
-        if any(keyword in filename_lower for keyword in ['w2', 'w-2']):
-            return "W-2"
-        
-        # Check content
-        w2_score = 0
-        w2_indicators = ['w-2', 'wage and tax statement', 'employer identification', 
-                        'federal income tax withheld', 'social security wages', 'medicare']
-        
-        for indicator in w2_indicators:
-            if indicator in text_lower:
-                w2_score += 1
-        
-        # Check for numbered boxes typical of W-2
-        box_matches = len(re.findall(r'\b[1-9]\s+(?:wages|federal|social|medicare)', text_lower))
-        w2_score += box_matches
-        
-        if w2_score >= 2:
-            return "W-2"
-        
-        return "Unknown"
+    def smart_field_extraction(self, text: str) -> Dict[str, Any]:
+        """Main extraction method using line-by-line parsing"""
+        return self.parse_w2_line_by_line(text)
 
-    def _extract_generic_data(self, text: str) -> Dict[str, Any]:
-        """Extract data from unknown document types"""
-        return {
-            "document_type": "Unknown",
-            "extracted_text": text[:500] + "..." if len(text) > 500 else text,
-            "confidence": 0.3,
-            "extraction_method": "Generic",
-            "message": "Document type not recognized. Please verify the extracted information."
-        }
+    def process_document(self, file_path: str) -> Dict[str, Any]:
+        """Process document with precise line-by-line W2 extraction"""
+        try:
+            file_ext = os.path.splitext(file_path)[1].lower()
+            logger.info(f"Processing {file_ext} document with line-by-line W2 extraction")
 
-    def _generate_mock_data(self, file_path: str) -> Dict[str, Any]:
-        """Generate mock data when OCR fails"""
-        filename = os.path.basename(file_path).lower()
-        
-        if "w2" in filename or "w-2" in filename:
+            if file_ext in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']:
+                text, confidence = self.extract_text_from_image(file_path)
+                extracted_fields = self.smart_field_extraction(text)
+                best_confidence = confidence
+                
+            elif file_ext == '.pdf':
+                # Focus on the W2 page (usually page 2)
+                all_extracted = {}
+                best_confidence = 0.0
+                w2_text = ""
+                
+                # Try pages in order of likelihood for W2 content
+                page_priorities = [0, 1, 2]  # Page 2 first, then 1, then 3
+                
+                for page_num in page_priorities:
+                    try:
+                        text, confidence = self.extract_text_from_pdf_page(file_path, page_num)
+                        
+                        #if not text or len(text.strip()) < 50:
+                        #    continue
+                        
+                        # Check if this page contains W2 structure
+                        w2_indicators = ['wage and tax statement', 'w-2', 'social security number', 
+                                       'employer identification', 'wages, tips', 'federal income tax']
+                        has_w2_structure = any(indicator in text.lower() for indicator in w2_indicators)
+                        
+                        logger.info(f"\n=== PROCESSING PAGE {page_num + 1} (W2 Structure: {has_w2_structure}) ===")
+                        
+                        if has_w2_structure:
+                            page_extracted = self.smart_field_extraction(text)
+                            # Prefer results from W2 pages
+                            all_extracted.update(page_extracted)
+                            best_confidence = max(best_confidence, confidence)
+                            w2_text = text
+                            break  # Stop after finding W2 page
+                        elif not all_extracted:  # Use as fallback if no W2 page found yet
+                            page_extracted = self.smart_field_extraction(text)
+                            all_extracted.update(page_extracted)
+                            best_confidence = max(best_confidence, confidence)
+                            w2_text = text
+                        
+                    except Exception as e:
+                        logger.warning(f"Error processing page {page_num + 1}: {e}")
+                        continue
+                
+                text = w2_text
+                lines = text.splitlines()
+                extra_fields = self.extract_additional_w2_fields(lines)
+                print("🔍 Extra Fields:", extra_fields)
+                extracted_fields = {*all_extracted,*extra_fields}
+                print("🔍 Extracted Extra Fields:", extracted_fields)
+                
+            else:
+                return {
+                    'is_w2': False,
+                    'error': f'Unsupported file type: {file_ext}',
+                    'confidence': 0.0
+                }
+
+            # Determine if this is a valid W2
+            w2_indicators = ['w-2', 'wage and tax statement', 'form w-2', 'employer identification', 
+                           'social security number', 'wages, tips', 'federal income tax']
+            has_structure = any(indicator in text.lower() for indicator in w2_indicators)
+            has_key_fields = any(key in extracted_fields for key in ['employee_ssn', 'employer_ein', 'wages_tips_compensation'])
+            has_minimum_data = len(extracted_fields) >= 3
+            
+            is_w2 = has_structure and (has_key_fields or has_minimum_data)
+
+            logger.info(f"🏁 LINE-BY-LINE W2 EXTRACTION RESULTS:")
+            logger.info(f"   Is W2: {is_w2}")
+            logger.info(f"   Has structure: {has_structure}")
+            logger.info(f"   Has key fields: {has_key_fields}")
+            logger.info(f"   Fields found: {len(extracted_fields)}")
+            logger.info(f"   Confidence: {best_confidence:.2f}")
+            logger.info(f"   Final extracted fields:")
+            for key, value in extracted_fields.items():
+                if isinstance(value, float):
+                    logger.info(f"     {key}: ${value:,.2f}")
+                else:
+                    logger.info(f"     {key}: {value}")
+
             return {
-                "document_type": "W-2",
-                "employer_name": "Demo Corp Inc",
-                "wages": round(random.uniform(40000, 120000), 2),
-                "federal_withholding": round(random.uniform(5000, 20000), 2),
-                "state_withholding": round(random.uniform(2000, 8000), 2),
-                "confidence": 0.85,
-                "extraction_method": "Mock",
-                "note": "Mock data - OCR not available"
+                'is_w2': is_w2,
+                'confidence': best_confidence,
+                'raw_text': text[:500] + "..." if len(text) > 500 else text,
+                'extracted_fields': extracted_fields,
+                'error': None
             }
-        else:
+
+        except Exception as e:
+            logger.error(f"Error processing document: {e}")
+            import traceback
+            traceback.print_exc()
             return {
-                "document_type": "Unknown",
-                "confidence": 0.5,
-                "extraction_method": "Mock",
-                "note": "Mock data - OCR not available"
+                'is_w2': False,
+                'error': str(e),
+                'confidence': 0.0,
+                'raw_text': '',
+                'extracted_fields': {}
             }
-
-# Create global processor instance
-processor = DocumentProcessor()
-
-def extract_document_data(file_path: str, content_type: str) -> Dict[str, Any]:
-    """Main function to extract real data from documents"""
-    return processor.extract_document_data(file_path, content_type)
